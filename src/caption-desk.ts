@@ -2,18 +2,25 @@ import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
   applyRules,
+  applyRoster,
   cloneModel,
   createInitialModel,
+  isSuspended,
   mergeConfirmedSegments,
+  migrateModel,
   normalizeNumbers,
   queueStats,
+  reassignSpeaker,
+  rosterSyncFailed,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
+  type BackfillException,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
   type SegmentState,
+  type SpeakerRoster,
   type ToastMessage,
 } from './model';
 
@@ -39,6 +46,14 @@ function stateLabel(state: SegmentState): string {
     stale: '过期修改',
     ignored: '已忽略',
   }[state];
+}
+
+function reconcileLabel(status: CaptionSegment['reconcileStatus']): string {
+  return {
+    matched: '已对账',
+    missing: '待确认',
+    changed: '已变更',
+  }[status ?? 'missing'];
 }
 
 function connectionLabel(state: ConnectionState): string {
@@ -174,6 +189,40 @@ export class CaptionDesk extends LitElement {
     .segment-foot b { color: #0f62fe; font-weight: 500; }
     .issue-note { margin-top: 8px; padding: 7px 8px; background: #fff8e1; border-left: 2px solid #f1c21b; color: #684e00; font-size: 10px; line-height: 1.45; }
     .duplicate-note { background: #f6f2ff; border-color: #a56eff; color: #491d8b; }
+    .suspend-note { background: #fff1f1; border-color: #fa4d56; color: #a2191f; }
+
+    .segment-badges { display: inline-flex; align-items: center; gap: 6px; }
+    .reconcile-badge { padding: 1px 6px; border: 1px solid; font-size: 9px; line-height: 1.4; }
+    .reconcile-badge.matched { color: #198038; border-color: #42be65; background: #defbe6; }
+    .reconcile-badge.missing { color: #a2191f; border-color: #fa4d56; background: #fff1f1; }
+    .reconcile-badge.changed { color: #8d6e00; border-color: #f1c21b; background: #fff8e1; }
+    .segment-card.suspended { border-left-color: #fa4d56; }
+    .segment-card.suspended .segment-text { color: var(--cds-text-secondary, #525252); }
+
+    .reconcile-note { display: flex; align-items: center; gap: 8px; padding: 8px 10px; font-size: 11px; line-height: 1.4; }
+    .reconcile-note.matched { background: #defbe6; border-left: 2px solid #42be65; color: #198038; }
+    .reconcile-note.matched span { padding: 1px 6px; border: 1px solid #42be65; font-size: 9px; }
+    .reconcile-note.matched b { font-weight: 600; }
+    .reconcile-note.matched i { font-style: normal; color: #525252; }
+    .reconcile-note.matched em { font-style: normal; color: #525252; font-size: 10px; }
+    .suspend-hint { color: #a2191f; }
+
+    .roster-status { padding: 8px 12px; font-size: 10px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); color: var(--cds-text-secondary, #525252); }
+    .roster-status.syncing { color: #0f62fe; background: #edf5ff; }
+    .roster-status.failed { color: #a2191f; background: #fff1f1; }
+    .roster-list { padding: 4px 0; }
+    .roster-item { padding: 7px 12px; display: flex; align-items: baseline; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .roster-item:last-child { border-bottom: 0; }
+    .roster-item strong { font-size: 12px; font-weight: 600; }
+    .roster-item span { color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .roster-actions { padding: 10px 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .roster-error { margin: 0 12px 12px; padding: 8px 10px; background: #fff1f1; border-left: 2px solid #fa4d56; color: #a2191f; font-size: 10px; line-height: 1.5; }
+    .backfill-box { margin: 0 12px 12px; border: 1px solid #f1c21b; background: #fff8e1; }
+    .backfill-head { padding: 7px 10px; font-size: 10px; color: #684e00; border-bottom: 1px solid #f1c21b; }
+    .backfill-item { width: 100%; padding: 7px 10px; display: flex; align-items: center; gap: 8px; background: transparent; border: 0; border-bottom: 1px solid #f1c21b; color: #684e00; text-align: left; cursor: pointer; font-size: 10px; }
+    .backfill-item:last-child { border-bottom: 0; }
+    .backfill-item:hover { background: #fff3c4; }
+    .backfill-item strong { color: #8d6e00; font-family: "IBM Plex Mono", monospace; }
 
     .empty { padding: 48px 24px; text-align: center; color: var(--cds-text-secondary, #525252); }
     .empty strong { display: block; color: var(--cds-text-primary, #161616); margin-bottom: 6px; }
@@ -272,8 +321,8 @@ export class CaptionDesk extends LitElement {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        const parsed = JSON.parse(raw) as Partial<DeskModel>;
+        if (parsed.segments?.length) return migrateModel(parsed);
       }
     } catch {
       // 损坏草稿会回退到演示数据。
@@ -436,6 +485,10 @@ export class CaptionDesk extends LitElement {
       this.pushToast('warning', '没有可确认的片段', '请先从待确认区选择字幕');
       return;
     }
+    if (isSuspended(selected)) {
+      this.pushToast('warning', '片段已挂起，暂不送直播区', selected.reconcileNote || '发言人待会务组确认，请先在编辑台指定名册发言人');
+      return;
+    }
     const { text, used } = applyRules(selected.corrected, this.model);
     const offline = this.model.connection === 'offline';
     const nextOrder = this.pendingSegments.filter((item) => item.id !== selected.id);
@@ -493,6 +546,88 @@ export class CaptionDesk extends LitElement {
     this.persist();
     const outboxCount = this.model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
     this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+  }
+
+  /**
+   * 向会务组重新领取名册副本。
+   * 对账失败只重领名册：字幕稿与旧名册都不动，提示后可再次重领。
+   */
+  private async syncRoster(): Promise<void> {
+    if (this.model.rosterStatus === 'syncing') return;
+    this.automatic({ ...this.model, rosterStatus: 'syncing', rosterError: undefined });
+    await new Promise((resolve) => window.setTimeout(resolve, 650 + Math.random() * 550));
+    if (Math.random() < 0.22) {
+      this.automatic(rosterSyncFailed(this.model, '会务组名册对账超时，未拿到新名册副本'));
+      this.pushToast('error', '名册对账失败', '只重新领取名册副本，字幕稿未改动');
+      return;
+    }
+    const nextRoster: SpeakerRoster = {
+      ...this.model.roster,
+      version: this.model.roster.version + 1,
+      fetchedAt: Date.now(),
+    };
+    this.automatic(applyRoster(this.model, nextRoster));
+    this.pushToast('success', '名册已更新', `版本 v${nextRoster.version}，已按挂名逐条对账`);
+  }
+
+  /** 模拟会务组改写法/换人：周然 → 周燃，触发已对账片段变「已变更」并挂起 */
+  private simulateRosterChange(): void {
+    const roster: SpeakerRoster = structuredClone(this.model.roster);
+    const entry = roster.entries.find((item) => item.id === 'r-3');
+    if (entry) {
+      const renamed = entry.name === '周然' ? '周燃' : '周然';
+      entry.name = renamed;
+      entry.aliases = ['嘉宾', '周工'];
+      entry.updatedAt = Date.now();
+    }
+    roster.version += 1;
+    roster.fetchedAt = Date.now();
+    this.automatic(applyRoster(this.model, roster));
+    this.pushToast('warning', '会务组名册已变更', `「周然」已改写法，相关片段挂起待会务组确认`);
+  }
+
+  /** 编辑片段挂名后重跑对账；对得上名册则记为名册来源，否则记为字幕台自填 */
+  private updateSpeaker(speaker: string): void {
+    const selected = this.selected;
+    if (!selected) return;
+    this.commit('修改发言人', (current) => ({
+      ...current,
+      segments: reassignSpeaker(current.segments, selected.id, speaker, current.roster),
+    }));
+  }
+
+  /** 回填异常条目：重新选择发言人名册条目后即可消除 */
+  private resolveBackfill(entry: BackfillException): void {
+    const target = this.model.segments.find((item) => item.id === entry.segmentId);
+    if (!target) return;
+    this.selectSegment(target.id);
+    this.pushToast('info', '请为该片段指定名册发言人', `第 ${entry.sequence} 段当前挂名「${entry.speaker}」不在名册中`);
+  }
+
+  /** 发言人下拉选项：名册条目（正式姓名·职务）在前，名册外的在后，当前挂名不在选项中时补到首位 */
+  private speakerOptionsFor(item: CaptionSegment): { value: string; label: string }[] {
+    const rosterOptions = this.model.roster.entries.map((entry) => ({
+      value: entry.name,
+      label: `${entry.name} · ${entry.title}`,
+    }));
+    const external = [
+      { value: '现场提问', label: '现场提问（名册外）' },
+      { value: '未知发言人', label: '未知发言人（名册外）' },
+    ];
+    const options = [...rosterOptions, ...external];
+    if (!options.some((option) => option.value === item.speaker)) {
+      options.unshift({ value: item.speaker, label: `${item.speaker}（当前挂名）` });
+    }
+    return options;
+  }
+
+  private rosterStatusText(): string {
+    switch (this.model.rosterStatus) {
+      case 'syncing': return '正在向会务组领取名册副本…';
+      case 'synced': return `名册已同步 · 最近领取 ${new Date(this.model.roster.fetchedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
+      case 'failed': return '名册对账失败，可重新领取（字幕稿不动）';
+      default: return '尚未领取名册';
+    }
   }
 
   private addRuleFromSelection(): void {
@@ -602,19 +737,23 @@ export class CaptionDesk extends LitElement {
     return html`
       <div class="segment-list">
         ${segments.map((item) => html`
-          <button class="segment-card ${item.id === this.model.selectedId ? 'selected' : ''} ${item.state}" @click=${() => this.selectSegment(item.id)}>
+          <button class="segment-card ${item.id === this.model.selectedId ? 'selected' : ''} ${item.state} ${isSuspended(item) ? 'suspended' : ''}" @click=${() => this.selectSegment(item.id)}>
             <div class="segment-meta">
               <span>${formatClock(item.startTime)} · #${String(item.sequence).padStart(3, '0')}</span>
-              <span class="segment-state ${item.state}">${stateLabel(item.state)}</span>
+              <span class="segment-badges">
+                ${item.reconcileStatus ? html`<span class="reconcile-badge ${item.reconcileStatus}">${reconcileLabel(item.reconcileStatus)}</span>` : nothing}
+                <span class="segment-state ${item.state}">${stateLabel(item.state)}</span>
+              </span>
             </div>
             <p class="segment-text">${item.original}</p>
             ${item.corrected !== item.original ? html`<p class="segment-corrected">${item.corrected}</p>` : nothing}
             <div class="segment-foot">
-              <span>${item.speaker}</span>
+              <span>${item.reconcileStatus === 'matched' && item.speakerFormalName ? `${item.speakerFormalName} · ${item.speakerTitle ?? ''}` : item.speaker}</span>
               <span>·</span>
               <span>${formatAge(item.receivedAt)}</span>
               ${item.revision > 0 ? html`<span>· <b>修改 ${item.revision} 次</b></span>` : nothing}
             </div>
+            ${isSuspended(item) ? html`<div class="issue-note suspend-note">挂起待会务组确认：${item.reconcileNote || '发言人不在名册中'}，挂起期间不送直播区。</div>` : nothing}
             ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对直播上下文。</div>` : nothing}
             ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}，请保留或忽略。</div>` : nothing}
           </button>
@@ -652,11 +791,27 @@ export class CaptionDesk extends LitElement {
               <cds-inline-notification kind="warning" low-contrast title="过期修改" subtitle=${`${item.staleReason || '该片段已超过 90 秒未确认'}。请结合上下文确认，或忽略以避免污染直播区。`}></cds-inline-notification>
             ` : nothing}
             <div class="form-grid">
-              <cds-select label-text="发言人" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
-                ${['主持人', '主讲人', '嘉宾 / 周然', '现场提问', '未知发言人'].map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
+              <cds-select label-text="发言人（挂名）" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSpeaker(event.detail.value)}>
+                ${this.speakerOptionsFor(item).map((option) => html`<cds-select-item value=${option.value}>${option.label}</cds-select-item>`)}
               </cds-select>
               <cds-number-input class="number-input" label="延迟（秒）" .value=${this.model.simulatedDelay} step="0.1" min="0" max="9" @input=${(event: Event) => this.automatic({ ...this.model, simulatedDelay: Number((event.currentTarget as any).value) })}></cds-number-input>
             </div>
+            ${item.reconcileStatus === 'matched' ? html`
+              <div class="reconcile-note matched">
+                <span>已对账</span>
+                <b>${item.speakerFormalName}</b>
+                <i>${item.speakerTitle}</i>
+                ${item.speakerSource === 'legacy' ? html`<em>（旧数据已回填）</em>` : nothing}
+              </div>
+            ` : html`
+              <cds-inline-notification
+                kind=${item.reconcileStatus === 'changed' ? 'warning' : 'error'}
+                low-contrast
+                title=${item.reconcileStatus === 'changed' ? '名册已变更，片段挂起' : '发言人不在名册，片段挂起'}
+                subtitle=${item.reconcileNote || '待会务组确认后才能送入直播区'}
+                hide-close-button
+              ></cds-inline-notification>
+            `}
             <cds-textarea
               class="caption-input"
               label-text="校对后的字幕文本"
@@ -682,10 +837,15 @@ export class CaptionDesk extends LitElement {
             </div>
           </div>
           <div class="confirm-bar">
-            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段</div>
+            <div class="confirm-hint">
+              ${isSuspended(item)
+                ? html`<span class="suspend-hint">挂起中 · 待会务组确认发言人后才能送入直播区</span>`
+                : html`<kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区`}
+              · <kbd>Alt J/K</kbd> 切换片段
+            </div>
             <div>
               <cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
-              <cds-button kind="primary" @click=${this.confirmSelected}>确认并送入直播区</cds-button>
+              <cds-button kind="primary" ?disabled=${isSuspended(item)} @click=${this.confirmSelected}>确认并送入直播区</cds-button>
             </div>
           </div>
         </div>
@@ -727,6 +887,42 @@ export class CaptionDesk extends LitElement {
           ` : html`
             <div style="padding: 10px;"><cds-button kind="tertiary" size="sm" @click=${() => { this.showRuleForm = true; }}>＋ 新增术语规则</cds-button></div>
           `}
+        </section>
+
+        <section class="inspector-section">
+          <div class="inspector-section-head">
+            <h3>会务组名册</h3>
+            <span>v${this.model.roster.version} · ${this.model.roster.entries.length} 人</span>
+          </div>
+          <div class="roster-status ${this.model.rosterStatus}">${this.rosterStatusText()}</div>
+          <div class="roster-list">
+            ${this.model.roster.entries.map((entry) => html`
+              <div class="roster-item">
+                <strong>${entry.name}</strong>
+                <span>${entry.title}</span>
+              </div>
+            `)}
+          </div>
+          <div class="roster-actions">
+            <cds-button kind="primary" size="sm" ?disabled=${this.model.rosterStatus === 'syncing'} @click=${this.syncRoster}>
+              ${this.model.rosterStatus === 'syncing' ? '领取中…' : '重新领取名册'}
+            </cds-button>
+            <cds-button kind="ghost" size="sm" @click=${this.simulateRosterChange}>模拟名册变更</cds-button>
+          </div>
+          ${this.model.rosterStatus === 'failed' ? html`
+            <div class="roster-error">对账失败：${this.model.rosterError}。只重领名册副本，字幕稿未改动。</div>
+          ` : nothing}
+          ${this.model.backfillExceptions.length ? html`
+            <div class="backfill-box">
+              <div class="backfill-head">旧数据回填异常（${this.model.backfillExceptions.length}）· 点击去指定发言人</div>
+              ${this.model.backfillExceptions.map((entry) => html`
+                <button class="backfill-item" @click=${() => this.resolveBackfill(entry)}>
+                  <strong>#${entry.sequence}</strong>
+                  <span>挂名「${entry.speaker}」对不上名册</span>
+                </button>
+              `)}
+            </div>
+          ` : nothing}
         </section>
 
         <section class="inspector-section">
@@ -794,12 +990,12 @@ export class CaptionDesk extends LitElement {
         <section class="status-strip">
           <div class="status-cell hero">
             <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
-            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
+            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 挂起 ${stats.suspended} · 离线待合并 ${stats.offline}</span>
             <div class="queue-track"><span style=${`width:${backlogRatio}%`}></span></div>
           </div>
           <div class="status-cell"><strong>${stats.pending}</strong><span>待确认片段</span></div>
           <div class="status-cell warning"><strong>${stats.oldestWaitSeconds}s</strong><span>最长等待时间</span></div>
-          <div class="status-cell danger"><strong>${stats.stale + stats.duplicate}</strong><span>需要明确处理</span></div>
+          <div class="status-cell danger"><strong>${stats.stale + stats.duplicate + stats.suspended}</strong><span>需要明确处理</span></div>
           <div class="status-cell"><strong>${this.model.simulatedDelay.toFixed(1)}s</strong><span>当前流延迟</span></div>
           <div class="font-controls">
             <label>字幕字号</label>

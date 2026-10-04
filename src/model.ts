@@ -2,6 +2,38 @@ export type ConnectionState = 'connected' | 'degraded' | 'offline';
 export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
 export type SegmentSource = 'live' | 'offline' | 'manual';
 
+/** 发言人对账状态：已对账 / 名册无此人 / 名册已换人或改写法 */
+export type ReconcileStatus = 'matched' | 'missing' | 'changed';
+/** 发言人来源：名册领取 / 字幕台自填 / 旧数据未记录来源 */
+export type SpeakerSource = 'roster' | 'manual' | 'legacy';
+
+/** 会务组出席名册条目：正式姓名与职务由会务组侧维护 */
+export interface RosterEntry {
+  id: string;
+  name: string;
+  title: string;
+  aliases: string[];
+  updatedAt: number;
+}
+
+/** 会务组名册副本：字幕台只领一份，不直接改 */
+export interface SpeakerRoster {
+  entries: RosterEntry[];
+  version: number;
+  fetchedAt: number;
+}
+
+/** 旧数据回填时对不上发言人的异常条目，单列出来待处理 */
+export interface BackfillException {
+  segmentId: string;
+  sequence: number;
+  speaker: string;
+  reason: string;
+}
+
+/** 名册对账（领取）状态 */
+export type RosterSyncStatus = 'idle' | 'syncing' | 'synced' | 'failed';
+
 export interface CaptionSegment {
   id: string;
   sequence: number;
@@ -9,6 +41,17 @@ export interface CaptionSegment {
   receivedAt: number;
   confirmedAt?: number;
   speaker: string;
+  /** 发言人来源，旧数据可能为空，升级时回填 */
+  speakerSource?: SpeakerSource;
+  /** 对账匹配到的名册条目 id */
+  rosterEntryId?: string;
+  /** 回填的正式姓名（来自名册） */
+  speakerFormalName?: string;
+  /** 回填的职务（来自名册） */
+  speakerTitle?: string;
+  /** 发言人对账状态 */
+  reconcileStatus?: ReconcileStatus;
+  reconcileNote?: string;
   original: string;
   corrected: string;
   numberHints: string;
@@ -42,6 +85,13 @@ export interface DeskModel {
   fontSize: number;
   nextSequence: number;
   autoStream: boolean;
+  /** 会务组出席名册副本（正式姓名与职务），字幕台只领取、不维护 */
+  roster: SpeakerRoster;
+  /** 名册领取状态：对账失败只重领名册，不动字幕稿 */
+  rosterStatus: RosterSyncStatus;
+  rosterError?: string;
+  /** 旧数据回填时对不上发言人的条目，单列待处理 */
+  backfillExceptions: BackfillException[];
   lastMergedAt?: number;
   updatedAt: number;
 }
@@ -99,11 +149,33 @@ const duplicate: CaptionSegment = {
   staleReason: '与第 2 段高度相似',
 };
 
-export function createInitialModel(): DeskModel {
+/** 旧数据里挂了「现场提问」，名册中没有对应正式姓名，升级时回填不上、单列出来 */
+const legacyUnmatched: CaptionSegment = segment(
+  'seg-9', 9, 70, '现场提问',
+  '现场观众的声音也需要收录进字幕。', '现场观众的声音也需要收录进字幕。',
+  'pending',
+);
+
+/** 会务组出席名册默认副本：正式姓名与职务由会务组侧维护，字幕台只领取使用 */
+export function createDefaultRoster(): SpeakerRoster {
+  const now = Date.now();
   return {
+    version: 1,
+    fetchedAt: now,
+    entries: [
+      { id: 'r-1', name: '李婷', title: '主持人', aliases: ['主持人', '主持'], updatedAt: now },
+      { id: 'r-2', name: '陈杰', title: '技术副总裁', aliases: ['主讲人', '主讲', '主讲嘉宾'], updatedAt: now },
+      { id: 'r-3', name: '周然', title: '高级工程师', aliases: ['嘉宾', '周工'], updatedAt: now },
+      { id: 'r-4', name: '王芳', title: '市场总监', aliases: ['市场', '市场部'], updatedAt: now },
+    ],
+  };
+}
+
+export function createInitialModel(): DeskModel {
+  const model: DeskModel = {
     eventName: '新品发布会现场字幕',
     eventDate: new Date(now).toISOString().slice(0, 10),
-    segments: [...seededSegments, duplicate],
+    segments: [...seededSegments, duplicate, legacyUnmatched],
     rules: [
       { id: 'term-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 4, createdAt: now - 86_400_000 },
       { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000 },
@@ -113,14 +185,180 @@ export function createInitialModel(): DeskModel {
     connection: 'connected',
     simulatedDelay: 1.8,
     fontSize: 18,
-    nextSequence: 9,
+    nextSequence: 10,
     autoStream: true,
+    roster: createDefaultRoster(),
+    rosterStatus: 'synced',
+    backfillExceptions: [],
     updatedAt: now,
   };
+  // 演示数据同样按旧数据回填：对得上名册的记为名册来源，对不上的列入回填异常
+  return backfillLegacySpeakers(model);
 }
 
 export function cloneModel(model: DeskModel): DeskModel {
   return structuredClone(model);
+}
+
+/**
+ * 按片段挂的姓名在会务组名册里逐条对账。
+ * 匹配规则：正式姓名精确相等 / 别名相等 / 挂名包含正式姓名或别名（如「嘉宾 / 周然」含「周然」）。
+ */
+export function matchSpeaker(speaker: string | undefined, roster: SpeakerRoster): RosterEntry | undefined {
+  const name = (speaker ?? '').trim();
+  if (!name) return undefined;
+  return roster.entries.find((entry) => {
+    if (entry.name === name) return true;
+    if (entry.aliases.some((alias) => alias === name)) return true;
+    if (entry.name.length >= 2 && name.includes(entry.name)) return true;
+    if (entry.aliases.some((alias) => alias.length >= 2 && name.includes(alias))) return true;
+    return false;
+  });
+}
+
+/** 挂名是否引用了某个正式姓名（精确相等或包含，如「嘉宾 / 周然」引用「周然」） */
+function speakerReferences(speaker: string, name: string): boolean {
+  const value = speaker.trim();
+  if (value === name) return true;
+  return name.length >= 2 && value.includes(name);
+}
+
+/** 单条片段对账：名册里没有 → missing；以前对得上现在对不上（换人/改写法）→ changed */
+export function reconcileSegment(segment: CaptionSegment, roster: SpeakerRoster): CaptionSegment {
+  const match = matchSpeaker(segment.speaker, roster);
+  if (match) {
+    const previousEntry = segment.rosterEntryId
+      ? roster.entries.find((entry) => entry.id === segment.rosterEntryId)
+      : undefined;
+    // 以前对得上某个名册条目：该条目被删，或其正式姓名已不被挂名引用（换人/改写法）→ changed
+    const entryRemoved = previousEntry === undefined && segment.rosterEntryId !== undefined;
+    const nameChanged = previousEntry !== undefined && !speakerReferences(segment.speaker, previousEntry.name);
+    const changed = entryRemoved || nameChanged;
+    return {
+      ...segment,
+      rosterEntryId: match.id,
+      speakerFormalName: match.name,
+      speakerTitle: match.title,
+      reconcileStatus: changed ? 'changed' : 'matched',
+      reconcileNote: changed
+        ? `名册已变更：原「${segment.speakerFormalName ?? segment.speaker}」已替换为「${match.name}」`
+        : undefined,
+    };
+  }
+  const wasMatched = segment.rosterEntryId !== undefined;
+  return {
+    ...segment,
+    reconcileStatus: wasMatched ? 'changed' : 'missing',
+    reconcileNote: wasMatched
+      ? '名册中已无此发言人，可能已换人或改写法'
+      : '名册中没有此发言人，待会务组确认',
+  };
+}
+
+/**
+ * 全量对账：只动未上屏（pending/stale/duplicate）的片段；
+ * 已上屏（confirmed）和已忽略的照旧留着，不暂停、不改写。
+ */
+export function reconcileSpeakers(model: DeskModel): DeskModel {
+  const segments = model.segments.map((segment) => {
+    if (segment.state === 'confirmed' || segment.state === 'ignored') return segment;
+    return reconcileSegment(segment, model.roster);
+  });
+  return {
+    ...model,
+    segments,
+    backfillExceptions: collectBackfillExceptions(segments),
+    updatedAt: Date.now(),
+  };
+}
+
+/** 收集旧数据回填时对不上发言人的条目，单列出来 */
+export function collectBackfillExceptions(segments: CaptionSegment[]): BackfillException[] {
+  return segments
+    .filter((segment) => segment.speakerSource === 'legacy' && segment.reconcileStatus === 'missing')
+    .map((segment) => ({
+      segmentId: segment.id,
+      sequence: segment.sequence,
+      speaker: segment.speaker,
+      reason: '旧数据未记录发言人来源，且名册中无对应正式姓名',
+    }));
+}
+
+/**
+ * 升级旧数据：按现有片段回填发言人来源。
+ * 对得上名册 → speakerSource='roster' 并回填正式姓名/职务；
+ * 对不上 → speakerSource='legacy' 并列入 backfillExceptions。
+ */
+export function backfillLegacySpeakers(model: DeskModel): DeskModel {
+  const segments = model.segments.map((segment) => {
+    if (segment.speakerSource) return segment;
+    const match = matchSpeaker(segment.speaker, model.roster);
+    if (match) {
+      return {
+        ...segment,
+        speakerSource: 'roster' as SpeakerSource,
+        rosterEntryId: match.id,
+        speakerFormalName: match.name,
+        speakerTitle: match.title,
+        reconcileStatus: 'matched' as ReconcileStatus,
+      };
+    }
+    return {
+      ...segment,
+      speakerSource: 'legacy' as SpeakerSource,
+      reconcileStatus: 'missing' as ReconcileStatus,
+      reconcileNote: '旧数据回填：名册中无此发言人',
+    };
+  });
+  return { ...model, segments, backfillExceptions: collectBackfillExceptions(segments), updatedAt: Date.now() };
+}
+
+/** 领取到新名册后对账：名册副本更新，字幕稿不动，只按挂名逐条对账 */
+export function applyRoster(model: DeskModel, roster: SpeakerRoster): DeskModel {
+  const reconciled = reconcileSpeakers({ ...model, roster, rosterStatus: 'synced', rosterError: undefined });
+  return { ...reconciled, backfillExceptions: collectBackfillExceptions(reconciled.segments) };
+}
+
+/** 名册领取失败：只记录失败状态，字幕稿与旧名册都不动，等重领 */
+export function rosterSyncFailed(model: DeskModel, error: string): DeskModel {
+  return { ...model, rosterStatus: 'failed', rosterError: error, updatedAt: Date.now() };
+}
+
+/**
+ * 读取本地草稿后的升级：补齐名册字段，并对旧数据回填发言人来源。
+ * 旧数据没有 roster / speakerSource，升级时按现有片段回填，回不上的列入 backfillExceptions。
+ */
+export function migrateModel(parsed: Partial<DeskModel>): DeskModel {
+  const base = createInitialModel();
+  const merged: DeskModel = {
+    ...base,
+    ...parsed,
+    roster: parsed.roster ?? base.roster,
+    rosterStatus: parsed.rosterStatus ?? 'synced',
+    rosterError: parsed.rosterError,
+    backfillExceptions: parsed.backfillExceptions ?? [],
+  };
+  return backfillLegacySpeakers(merged);
+}
+
+/** 待确认片段是否因发言人对不上而挂起（挂起期间不送直播区） */
+export function isSuspended(segment: CaptionSegment): boolean {
+  return (segment.state === 'pending' || segment.state === 'stale') && segment.reconcileStatus !== 'matched';
+}
+
+/** 编辑发言人后重跑这一条的对账；来源按是否对得上名册判定 */
+export function reassignSpeaker(segments: CaptionSegment[], selectedId: string, speaker: string, roster: SpeakerRoster): CaptionSegment[] {
+  return segments.map((segment) => {
+    if (segment.id !== selectedId) return segment;
+    const match = matchSpeaker(speaker, roster);
+    const base: CaptionSegment = {
+      ...segment,
+      speaker,
+      speakerSource: match ? 'roster' : 'manual',
+      revision: segment.revision + 1,
+    };
+    return reconcileSegment(base, roster);
+  });
 }
 
 export function normalizeNumbers(text: string): string {
@@ -211,14 +449,14 @@ export function mergeConfirmedSegments(model: DeskModel): DeskModel {
       return item;
     });
 
-  return {
+  return reconcileSpeakers({
     ...model,
     segments,
     connection: 'connected',
     simulatedDelay: Math.max(0.8, model.simulatedDelay - 0.7),
     lastMergedAt: Date.now(),
     updatedAt: Date.now(),
-  };
+  });
 }
 
 export function queueStats(model: DeskModel) {
@@ -226,17 +464,19 @@ export function queueStats(model: DeskModel) {
   const stale = model.segments.filter((item) => item.state === 'stale');
   const duplicate = model.segments.filter((item) => item.state === 'duplicate');
   const offline = model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed');
+  const suspended = model.segments.filter((item) => isSuspended(item)).length;
   return {
     pending: pending.length,
     stale: stale.length,
     duplicate: duplicate.length,
     offline: offline.length,
+    suspended,
     backlog: pending.length + stale.length + duplicate.length + offline.length,
     oldestWaitSeconds: pending.length ? Math.max(...pending.map((item) => Math.round((Date.now() - item.receivedAt) / 1000))) : 0,
   };
 }
 
-export function createLiveSegment(sequence: number): CaptionSegment {
+export function createLiveSegment(sequence: number, roster: SpeakerRoster): CaptionSegment {
   const speakers = ['主持人', '主讲人', '嘉宾 / 周然', '现场提问'];
   const samples = [
     '接下来请产品团队介绍新的工作流。',
@@ -247,12 +487,20 @@ export function createLiveSegment(sequence: number): CaptionSegment {
     '大家可以在会后查看完整回放和术语表。',
   ];
   const start = Math.max(0, sequence * 9 - 10);
+  const speaker = speakers[(sequence - 1) % speakers.length];
+  const match = matchSpeaker(speaker, roster);
   return {
     id: `seg-live-${sequence}-${Date.now().toString(36)}`,
     sequence,
     startTime: start,
     receivedAt: Date.now(),
-    speaker: speakers[(sequence - 1) % speakers.length],
+    speaker,
+    speakerSource: match ? 'roster' : 'manual',
+    rosterEntryId: match?.id,
+    speakerFormalName: match?.name,
+    speakerTitle: match?.title,
+    reconcileStatus: match ? 'matched' : 'missing',
+    reconcileNote: match ? undefined : '名册中没有此发言人，待会务组确认',
     original: samples[(sequence - 1) % samples.length],
     corrected: samples[(sequence - 1) % samples.length],
     numberHints: '',
@@ -271,7 +519,7 @@ export function simulateLatency(model: DeskModel): DeskModel {
   let nextSequence = model.nextSequence;
   let segments = model.segments;
   if (applyStream) {
-    const candidate = createLiveSegment(model.nextSequence);
+    const candidate = createLiveSegment(model.nextSequence, model.roster);
     const duplicate = isDuplicate(candidate, segments);
     segments = [...segments, duplicate ? { ...candidate, state: 'duplicate', duplicateOf: duplicate.id, staleReason: `与第 ${duplicate.sequence} 段重复` } : candidate];
     nextSequence += 1;
