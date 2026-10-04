@@ -4,15 +4,26 @@ import {
   applyRules,
   cloneModel,
   createInitialModel,
+  createRosterModel,
+  CURRENT_SCHEMA_VERSION,
+  findRosterEntry,
   mergeConfirmedSegments,
+  migrateModel,
   normalizeNumbers,
+  normalizeSpeakerKey,
   queueStats,
-  STORAGE_KEY,
+  reconcileSpeakers,
+  ROSTER_STORAGE_KEY,
+  rosterEntriesForVersion,
   simulateLatency,
+  STORAGE_KEY,
   toSrt,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
+  type MigrationReport,
+  type RosterEntry,
+  type RosterModel,
   type SegmentState,
   type ToastMessage,
 } from './model';
@@ -37,12 +48,18 @@ function stateLabel(state: SegmentState): string {
     confirmed: '已确认',
     duplicate: '重复片段',
     stale: '过期修改',
+    held: '挂起待确认',
     ignored: '已忽略',
   }[state];
 }
 
 function connectionLabel(state: ConnectionState): string {
   return { connected: '连接稳定', degraded: '延迟波动', offline: '离线校正' }[state];
+}
+
+interface BootState {
+  model: DeskModel;
+  roster: RosterModel;
 }
 
 @customElement('caption-desk')
@@ -162,18 +179,22 @@ export class CaptionDesk extends LitElement {
     .segment-card.duplicate { border-left-color: #a56eff; }
     .segment-card.stale { border-left-color: #f1c21b; background: color-mix(in srgb, #fff 92%, #f1c21b 8%); }
     .segment-card.confirmed { border-left-color: #42be65; }
+    .segment-card.held { border-left-color: #da1e28; background: color-mix(in srgb, #fff 93%, #fa4d56 7%); }
     .segment-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
     .segment-meta > span:first-child { color: var(--cds-text-secondary, #525252); font: 500 10px/1 "IBM Plex Mono", monospace; }
     .segment-state { font-size: 10px; color: #525252; }
     .segment-state.stale { color: #8d6e00; }
     .segment-state.duplicate { color: #6929c4; }
     .segment-state.confirmed { color: #198038; }
+    .segment-state.held { color: #da1e28; font-weight: 600; }
     .segment-text { margin: 0; font-size: var(--caption-font-size); line-height: 1.5; }
     .segment-corrected { margin: 6px 0 0; padding-left: 8px; border-left: 2px solid #42be65; color: #198038; font-size: calc(var(--caption-font-size) * .88); line-height: 1.45; }
-    .segment-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .segment-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: var(--cds-text-secondary, #525252); font-size: 10px; flex-wrap: wrap; }
     .segment-foot b { color: #0f62fe; font-weight: 500; }
+    .resolved-chip { color: #198038; }
     .issue-note { margin-top: 8px; padding: 7px 8px; background: #fff8e1; border-left: 2px solid #f1c21b; color: #684e00; font-size: 10px; line-height: 1.45; }
     .duplicate-note { background: #f6f2ff; border-color: #a56eff; color: #491d8b; }
+    .hold-note { background: #fff1f1; border-color: #fa4d56; color: #8a3a3f; }
 
     .empty { padding: 48px 24px; text-align: center; color: var(--cds-text-secondary, #525252); }
     .empty strong { display: block; color: var(--cds-text-primary, #161616); margin-bottom: 6px; }
@@ -211,12 +232,34 @@ export class CaptionDesk extends LitElement {
     .rule-form { padding: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .rule-form cds-text-input, .rule-form cds-button { width: 100%; }
     .rule-form .full { grid-column: 1 / -1; }
+
+    .roster-body { padding: 9px 10px 11px; display: flex; flex-direction: column; gap: 9px; }
+    .roster-sync { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .roster-sync > div { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .roster-sync small { color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .roster-entry { padding: 8px; border: 1px solid var(--cds-border-subtle, #e0e0e0); display: flex; flex-direction: column; gap: 6px; }
+    .roster-entry.inactive { opacity: .62; background: color-mix(in srgb, var(--cds-layer, #fff) 90%, #8d8d8d 10%); }
+    .roster-entry-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .roster-entry-head small { color: var(--cds-text-secondary, #525252); font-size: 9px; }
+    .roster-input { width: 100%; padding: 5px 7px; border: 1px solid var(--cds-border-strong, #8d8d8d); background: var(--cds-field, #fff); color: inherit; font: inherit; font-size: 11px; border-radius: 0; }
+    .roster-input:focus { outline: 2px solid #0f62fe; outline-offset: -2px; }
+    .roster-entry-actions { display: flex; gap: 4px; align-items: center; }
+    .roster-held { border-left: 3px solid #fa4d56; background: #fff1f1; padding: 8px 9px; color: #8a3a3f; }
+    .roster-held-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; font-weight: 600; }
+    .roster-held p { margin: 4px 0 0; font-size: 10px; line-height: 1.45; }
+    .roster-held-actions { display: flex; gap: 5px; margin-top: 7px; flex-wrap: wrap; }
+    .roster-add { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .roster-add .full { grid-column: 1 / -1; }
+    .migration-list { margin: 8px 0 0; padding-left: 16px; font-size: 10px; line-height: 1.7; }
+
     .live-timeline { padding: 6px 0; }
     .live-item { padding: 8px 11px; border-left: 3px solid #42be65; margin: 0 10px 7px; background: var(--cds-layer-02, #f4f4f4); }
     .live-item time { color: #198038; font: 500 9px/1 "IBM Plex Mono", monospace; }
     .live-item p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
+    .live-item small.onscreen-hold { color: #b81921; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
+    .delivery-status.held { background: #fff1f1; border-left-color: #fa4d56; color: #8a3a3f; }
 
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
@@ -238,7 +281,10 @@ export class CaptionDesk extends LitElement {
     }
   `;
 
-  @state() private model: DeskModel = this.loadModel();
+  private boot: BootState = this.bootstrap();
+
+  @state() private model: DeskModel = this.boot.model;
+  @state() private roster: RosterModel = this.boot.roster;
   @state() private dark = localStorage.getItem(`${STORAGE_KEY}-theme`) === 'dark';
   @state() private toasts: ToastMessage[] = [];
   @state() private ruleSource = '';
@@ -246,6 +292,9 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private failNextRefetch = false;
+  @state() private rosterName = '';
+  @state() private rosterTitle = '';
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -254,7 +303,7 @@ export class CaptionDesk extends LitElement {
     super.connectedCallback();
     window.addEventListener('keydown', this.handleShortcut);
     this.ticker = window.setInterval(() => {
-      const next = simulateLatency(this.model);
+      const next = simulateLatency(this.model, this.roster);
       const changed = JSON.stringify(next.segments) !== JSON.stringify(this.model.segments) || next.connection !== this.model.connection;
       if (!changed) return;
       this.model = next;
@@ -268,21 +317,46 @@ export class CaptionDesk extends LitElement {
     super.disconnectedCallback();
   }
 
-  private loadModel(): DeskModel {
+  /** 启动时各取各的账：字幕稿一份、会务组名册一份；旧稿在这里做升级回填。 */
+  private bootstrap(): BootState {
+    let roster: RosterModel;
+    try {
+      const raw = localStorage.getItem(ROSTER_STORAGE_KEY);
+      roster = raw ? JSON.parse(raw) as RosterModel : createRosterModel(1);
+      if (!roster.entries?.length) roster = createRosterModel(1);
+      if (roster.syncState === 'refetch-failed') roster = { ...roster, syncState: 'synced', lastError: undefined };
+    } catch {
+      roster = createRosterModel(1);
+    }
+    localStorage.setItem(ROSTER_STORAGE_KEY, JSON.stringify(roster));
+
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        if (parsed.segments?.length) {
+          if (parsed.schemaVersion !== CURRENT_SCHEMA_VERSION) {
+            const { model } = migrateModel(parsed, roster);
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(model));
+            return { model, roster };
+          }
+          // 名册可能在别处换过版，启动时按挂名补一遍正式信息。
+          const { segments } = reconcileSpeakers(parsed.segments, roster.entries);
+          return { model: { ...parsed, segments }, roster };
+        }
       }
     } catch {
       // 损坏草稿会回退到演示数据。
     }
-    return createInitialModel();
+    return { model: createInitialModel(), roster };
   }
 
   private persist(): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...this.model, updatedAt: Date.now() }));
+  }
+
+  private persistRoster(): void {
+    localStorage.setItem(ROSTER_STORAGE_KEY, JSON.stringify(this.roster));
   }
 
   private commit(label: string, update: (current: DeskModel) => DeskModel): void {
@@ -333,13 +407,37 @@ export class CaptionDesk extends LitElement {
     return queueStats(this.model);
   }
 
+  /** 挂起的挂名分组，供会务组在名册侧逐条确认。 */
+  private get heldGroups(): { name: string; sequences: number[] }[] {
+    const groups = new Map<string, number[]>();
+    for (const item of this.model.segments.filter((segment) => segment.state === 'held')) {
+      const list = groups.get(item.speaker) ?? [];
+      list.push(item.sequence);
+      groups.set(item.speaker, list);
+    }
+    return [...groups.entries()].map(([name, sequences]) => ({ name, sequences: sequences.sort((a, b) => a - b) }));
+  }
+
+  private get migration(): MigrationReport | undefined {
+    return this.model.migration && !this.model.migration.acknowledged ? this.model.migration : undefined;
+  }
+
   private get pendingSegments(): CaptionSegment[] {
     const items = this.model.segments.filter((item) => {
-      if (this.filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate';
-      if (this.filter === 'attention') return item.state === 'stale' || item.state === 'duplicate';
+      if (this.filter === 'active') return ['pending', 'stale', 'duplicate', 'held'].includes(item.state);
+      if (this.filter === 'attention') return ['stale', 'duplicate', 'held'].includes(item.state);
       return true;
     });
     return [...items].sort((a, b) => a.sequence - b.sequence);
+  }
+
+  /** 名册变动后用本地这份重新逐条对账，返回挂起/解除结果用于提示。 */
+  private applyRoster(roster: RosterModel): { held: number; resolved: number; onScreen: number } {
+    this.roster = roster;
+    this.persistRoster();
+    const result = reconcileSpeakers(this.model.segments, roster.entries);
+    this.automatic({ ...this.model, segments: result.segments });
+    return { held: result.heldNames.length, resolved: result.resolvedNames.length, onScreen: result.unmatchedOnScreen };
   }
 
   private updateSelected(patch: Partial<CaptionSegment>, label = ''): void {
@@ -430,10 +528,27 @@ export class CaptionDesk extends LitElement {
     this.updateSelected({ corrected: normalized, numberHints: normalized }, '规范化数字');
   }
 
+  /** 字幕台改挂名：改完立刻按名册重新对账，对不上当场挂起。 */
+  private changeSpeaker(name: string): void {
+    const selected = this.selected;
+    if (!selected || name === selected.speaker) return;
+    this.commit('修改挂名发言人', (current) => {
+      const mapped = current.segments.map((item) => item.id === selected.id
+        ? { ...item, speaker: name, speakerKey: normalizeSpeakerKey(name), revision: item.revision + 1 }
+        : item);
+      return { ...current, segments: reconcileSpeakers(mapped, this.roster.entries).segments };
+    });
+  }
+
   private confirmSelected(): void {
     const selected = this.selected;
     if (!selected) {
       this.pushToast('warning', '没有可确认的片段', '请先从待确认区选择字幕');
+      return;
+    }
+    if (selected.state === 'held') {
+      // 挂起期间不送进直播区。
+      this.pushToast('error', '发言人未通过名册对账，已挂起', '请会务组在右侧出席名册中确认、补录或改挂后再上屏');
       return;
     }
     const { text, used } = applyRules(selected.corrected, this.model);
@@ -448,13 +563,14 @@ export class CaptionDesk extends LitElement {
         source: offline ? 'offline' : item.source,
         confirmedAt: Date.now(),
         staleReason: item.state === 'stale' ? item.staleReason : undefined,
+        holdReason: undefined,
         tags: used.length ? [...new Set([...item.tags, '术语已应用'])] : item.tags,
         revision: item.revision + 1,
       } : item),
       rules: current.rules.map((rule) => used.includes(rule.id) ? { ...rule, usageCount: rule.usageCount + 1 } : rule),
       selectedId: nextOrder[0]?.id ?? selected.id,
     }));
-    this.pushToast(offline ? 'warning' : 'success', offline ? '已加入离线发件箱' : '字幕已进入直播区', offline ? '恢复连接后将按时间顺序合并' : `第 ${selected.sequence} 段已确认`);
+    this.pushToast(offline ? 'warning' : 'success', offline ? '已加入离线发件箱' : '字幕已进入直播区', offline ? '恢复连接后将按序号合并，并补一遍发言人对账' : `第 ${selected.sequence} 段已确认`);
   }
 
   private ignoreSelected(): void {
@@ -471,10 +587,13 @@ export class CaptionDesk extends LitElement {
   private recoverDuplicate(): void {
     const selected = this.selected;
     if (!selected) return;
-    this.commit('保留重复片段', (current) => ({
-      ...current,
-      segments: current.segments.map((item) => item.id === selected.id ? { ...item, state: 'pending', duplicateOf: undefined, staleReason: '重复提示已由校对员确认保留' } : item),
-    }));
+    this.commit('保留重复片段', (current) => {
+      const mapped = current.segments.map((item) => item.id === selected.id
+        ? { ...item, state: 'pending' as SegmentState, duplicateOf: undefined, staleReason: '重复提示已由校对员确认保留' }
+        : item);
+      // 恢复为待确认后立即参与发言人对账，对不上照样挂起。
+      return { ...current, segments: reconcileSpeakers(mapped, this.roster.entries).segments };
+    });
   }
 
   private setConnection(connection: ConnectionState): void {
@@ -483,16 +602,146 @@ export class CaptionDesk extends LitElement {
       connection,
       simulatedDelay: connection === 'connected' ? 0.8 : connection === 'degraded' ? 4.6 : current.simulatedDelay,
     }));
+    if (connection === 'offline') {
+      this.roster = { ...this.roster, syncState: 'synced' };
+      this.persistRoster();
+      this.pushToast('info', '名册也可离线继续改', '会务组侧的改动暂存本地，回网合并后统一补对账');
+    }
   }
 
+  /** 回网：离线片段按序号合并补送，合并后立刻按名册补对账。 */
   private mergeOffline(): void {
-    const merged = mergeConfirmedSegments(this.model);
+    const merged = mergeConfirmedSegments(this.model, this.roster);
     this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
     this.future = [];
     this.model = merged;
     this.persist();
-    const outboxCount = this.model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
-    this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    const offlineCount = this.model.segments.filter((item) => item.source === 'offline').length;
+    const heldCount = this.model.segments.filter((item) => item.state === 'held').length;
+    this.roster = { ...this.roster, syncState: 'synced', lastError: undefined, syncedAt: Date.now() };
+    this.persistRoster();
+    this.pushToast('success', '离线队列已按序号合并补送', `离线来源 ${offlineCount} 段 · 发言人挂起 ${heldCount} 段（不进直播区），过期修改继续提示`);
+  }
+
+  // ── 会务组出席名册（独立的那份账） ────────────────────────────────
+
+  /** 会务组侧重领名册：失败只重试自己这份，字幕稿不动。 */
+  private refetchRoster(): void {
+    if (this.model.connection === 'offline' || this.failNextRefetch) {
+      const reason = this.model.connection === 'offline' ? '当前处于断网状态，名册留在本地' : '模拟名册服务领取失败';
+      this.roster = { ...this.roster, syncState: 'refetch-failed', lastError: `${reason} · ${new Date().toLocaleTimeString('zh-CN')}` };
+      this.persistRoster();
+      this.failNextRefetch = false;
+      this.pushToast('error', '出席名册重领失败', '只重试会务组这份名册，字幕台片段正文未做任何改动');
+      return;
+    }
+    const entries = rosterEntriesForVersion(this.roster.serverVersion);
+    const summary = this.applyRoster({
+      ...this.roster,
+      entries,
+      syncState: 'synced',
+      lastError: undefined,
+      receivedAt: Date.now(),
+      syncedAt: Date.now(),
+    });
+    this.pushToast('success', '已重新领取出席名册', `按挂名逐条对账：新挂起 ${summary.held} 个姓名 · 解除挂起 ${summary.resolved} 个`);
+  }
+
+  /** 演示：会务组发布第二版名册（换人 / 改写法）。 */
+  private publishRosterRevision(): void {
+    const fresh = createRosterModel(2);
+    const summary = this.applyRoster({
+      ...fresh,
+      syncState: this.model.connection === 'offline' ? 'offline-pending' : 'synced',
+      receivedAt: Date.now(),
+      syncedAt: Date.now(),
+    });
+    this.pushToast('warning', '会务组发布了第二版名册', `已按新名册重新对账：挂起 ${summary.held} 个挂名，已上屏对不上的 ${summary.onScreen} 段照旧保留`);
+  }
+
+  private patchRosterEntry(id: string, patch: Partial<RosterEntry>): void {
+    const entries = this.roster.entries.map((entry) => entry.id === id ? { ...entry, ...patch } : entry);
+    const syncState: RosterModel['syncState'] = this.model.connection === 'offline' ? 'offline-pending' : 'synced';
+    this.applyRoster({ ...this.roster, entries, syncState, syncedAt: Date.now() });
+  }
+
+  private editRosterAliases(id: string, value: string): void {
+    const aliases = value.split(/[,，、]/u).map((item) => item.trim()).filter(Boolean);
+    this.patchRosterEntry(id, { aliases });
+  }
+
+  private toggleRosterEntry(entry: RosterEntry): void {
+    this.patchRosterEntry(entry.id, { active: !entry.active, replacedBy: entry.active ? entry.replacedBy : undefined });
+  }
+
+  /** 会务组确认：把挂着的名字补录进名册，挂起片段逐条自动解除。 */
+  private claimHeldName(name: string): void {
+    const entry: RosterEntry = {
+      id: `roster-${Date.now().toString(36)}`,
+      officialName: name,
+      title: '待会务组补全职务',
+      aliases: [name],
+      active: true,
+    };
+    const summary = this.applyRoster({
+      ...this.roster,
+      entries: [entry, ...this.roster.entries],
+      syncedAt: Date.now(),
+      syncState: this.model.connection === 'offline' ? 'offline-pending' : 'synced',
+    });
+    this.pushToast('success', `已把挂名「${name}」补录进名册`, `相关片段解除挂起，当前仍有 ${summary.held} 个挂名待确认`);
+  }
+
+  /** 会务组确认换人：把挂旧称呼的片段改挂到接手人，再对账解除。 */
+  private reattachHeldName(name: string): void {
+    const inactive = findRosterEntry(this.roster.entries, name);
+    const target = inactive?.replacedBy ? this.roster.entries.find((entry) => entry.id === inactive.replacedBy) : undefined;
+    if (!inactive || !target) {
+      this.pushToast('warning', '名册里没有接手人', '请先在名册中补录或改写法');
+      return;
+    }
+    this.commit(`会务组确认改挂到「${target.officialName}」`, (current) => {
+      const mapped = current.segments.map((item) => item.state === 'held' && item.speaker === name
+        ? { ...item, speaker: target.officialName, speakerKey: normalizeSpeakerKey(target.officialName), revision: item.revision + 1 }
+        : item);
+      return { ...current, segments: reconcileSpeakers(mapped, this.roster.entries).segments };
+    });
+  }
+
+  private addRosterEntry(): void {
+    const officialName = this.rosterName.trim();
+    const title = this.rosterTitle.trim();
+    if (!officialName) {
+      this.pushToast('warning', '正式姓名不能为空', '职务可以稍后再补');
+      return;
+    }
+    const entry: RosterEntry = {
+      id: `roster-${Date.now().toString(36)}`,
+      officialName,
+      title: title || '待补职务',
+      aliases: [officialName],
+      active: true,
+    };
+    const summary = this.applyRoster({
+      ...this.roster,
+      entries: [entry, ...this.roster.entries],
+      syncedAt: Date.now(),
+      syncState: this.model.connection === 'offline' ? 'offline-pending' : 'synced',
+    });
+    this.rosterName = '';
+    this.rosterTitle = '';
+    this.pushToast('success', '名册已新增发言人', `逐条对账后解除挂起 ${summary.resolved} 个挂名`);
+  }
+
+  private reconcileManually(): void {
+    const result = reconcileSpeakers(this.model.segments, this.roster.entries);
+    this.automatic({ ...this.model, segments: result.segments });
+    this.pushToast('info', '已按出席名册逐条对账', `挂起 ${result.heldNames.length} 个挂名 · 解除 ${result.resolvedNames.length} 个 · 已上屏未匹配 ${result.unmatchedOnScreen} 段照旧保留`);
+  }
+
+  private acknowledgeMigration(): void {
+    if (!this.model.migration) return;
+    this.automatic({ ...this.model, migration: { ...this.model.migration, acknowledged: true } });
   }
 
   private addRuleFromSelection(): void {
@@ -610,11 +859,13 @@ export class CaptionDesk extends LitElement {
             <p class="segment-text">${item.original}</p>
             ${item.corrected !== item.original ? html`<p class="segment-corrected">${item.corrected}</p>` : nothing}
             <div class="segment-foot">
-              <span>${item.speaker}</span>
+              <span title="片段上挂的姓名（字幕台持有）">挂名：${item.speaker}</span>
+              ${item.speakerResolved ? html`<span class="resolved-chip" title=${`名册正式信息：${item.speakerResolved.title}`}>→ ${item.speakerResolved.officialName} · ${item.speakerResolved.title}</span>` : nothing}
               <span>·</span>
               <span>${formatAge(item.receivedAt)}</span>
               ${item.revision > 0 ? html`<span>· <b>修改 ${item.revision} 次</b></span>` : nothing}
             </div>
+            ${item.state === 'held' ? html`<div class="issue-note hold-note">${item.holdReason}。挂起期间不送直播区，请会务组在右侧名册确认。</div>` : nothing}
             ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对直播上下文。</div>` : nothing}
             ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}，请保留或忽略。</div>` : nothing}
           </button>
@@ -629,6 +880,11 @@ export class CaptionDesk extends LitElement {
       return html`<div class="empty"><strong>选择一条待确认字幕</strong><p>可以使用 Alt+J / Alt+K 在片段之间移动。</p></div>`;
     }
     const applicableRules = this.model.rules.filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
+    const rosterNames: string[] = [];
+    for (const entry of this.roster.entries.filter((rosterEntry) => rosterEntry.active)) {
+      if (!rosterNames.includes(entry.officialName)) rosterNames.push(entry.officialName);
+    }
+    if (!rosterNames.includes(item.speaker)) rosterNames.unshift(item.speaker);
     return html`
       <div class="editor-scroll">
         <div class="editor-card">
@@ -638,11 +894,16 @@ export class CaptionDesk extends LitElement {
               <p class="editor-title">实时片段 #${String(item.sequence).padStart(3, '0')} · 到达于 ${formatAge(item.receivedAt)}</p>
             </div>
             <div class="editor-status">
-              <cds-tag type=${item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
+              <cds-tag type=${item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : item.state === 'held' ? 'red' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
               <cds-tag type="outline" size="sm">修改 ${item.revision} 次</cds-tag>
             </div>
           </div>
           <div class="editor-form">
+            ${item.state === 'held' ? html`
+              <cds-inline-notification kind="error" low-contrast title="发言人对账未通过，片段挂起中" subtitle=${item.holdReason || '名册查无此挂名'}>
+                <cds-button slot="action" size="sm" @click=${this.reconcileManually}>重新按名册对账</cds-button>
+              </cds-inline-notification>
+            ` : nothing}
             ${item.state === 'duplicate' ? html`
               <cds-inline-notification kind="warning" low-contrast title="重复片段提示" subtitle=${item.staleReason || '与已确认片段高度相似'}>
                 <cds-button slot="action" size="sm" @click=${this.recoverDuplicate}>保留并继续校对</cds-button>
@@ -652,11 +913,14 @@ export class CaptionDesk extends LitElement {
               <cds-inline-notification kind="warning" low-contrast title="过期修改" subtitle=${`${item.staleReason || '该片段已超过 90 秒未确认'}。请结合上下文确认，或忽略以避免污染直播区。`}></cds-inline-notification>
             ` : nothing}
             <div class="form-grid">
-              <cds-select label-text="发言人" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
-                ${['主持人', '主讲人', '嘉宾 / 周然', '现场提问', '未知发言人'].map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
+              <cds-select label-text="挂名发言人（按出席名册对账）" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.changeSpeaker(event.detail.value)}>
+                ${rosterNames.map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
               </cds-select>
               <cds-number-input class="number-input" label="延迟（秒）" .value=${this.model.simulatedDelay} step="0.1" min="0" max="9" @input=${(event: Event) => this.automatic({ ...this.model, simulatedDelay: Number((event.currentTarget as any).value) })}></cds-number-input>
             </div>
+            ${item.speakerResolved ? html`
+              <cds-inline-notification kind="info" low-contrast title=${`名册正式信息：${item.speakerResolved.officialName}`} subtitle=${`${item.speakerResolved.title} · 由出席名册 ${this.roster.versionName} 映上，字幕台不手抄职务`}></cds-inline-notification>
+            ` : nothing}
             <cds-textarea
               class="caption-input"
               label-text="校对后的字幕文本"
@@ -682,14 +946,127 @@ export class CaptionDesk extends LitElement {
             </div>
           </div>
           <div class="confirm-bar">
-            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段</div>
+            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段${item.state === 'held' ? ' · 挂起片段需会务组确认后才能上屏' : ''}</div>
             <div>
               <cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
-              <cds-button kind="primary" @click=${this.confirmSelected}>确认并送入直播区</cds-button>
+              <cds-button kind="primary" ?disabled=${item.state === 'held'} @click=${this.confirmSelected}>确认并送入直播区</cds-button>
             </div>
           </div>
         </div>
       </div>
+    `;
+  }
+
+  private renderRosterSection() {
+    const failed = this.roster.syncState === 'refetch-failed';
+    const offlinePending = this.model.connection === 'offline';
+    return html`
+      <section class="inspector-section">
+        <div class="inspector-section-head">
+          <h3>出席名册（会务组那份）</h3>
+          <span>${this.roster.versionName} · ${this.roster.entries.filter((entry) => entry.active).length} 人在册</span>
+        </div>
+        <div class="roster-body">
+          <div class="roster-sync">
+            <div>
+              <cds-tag type=${failed ? 'red' : offlinePending ? 'warm-gray' : 'green'} size="sm">
+                ${failed ? '重领失败' : offlinePending ? '离线暂存' : '已同步'}
+              </cds-tag>
+              <small>${failed ? (this.roster.lastError ?? '名册服务不可用') : `最近领取 ${formatAge(this.roster.syncedAt)}`}</small>
+            </div>
+            <div>
+              <cds-button kind="ghost" size="xs" @click=${this.toggleFailNextRefetch}>${this.failNextRefetch ? '✓ 下次领取将失败' : '模拟领取失败'}</cds-button>
+              <cds-button kind="tertiary" size="xs" @click=${this.refetchRoster}>重新领取</cds-button>
+              <cds-button kind="primary" size="xs" ?disabled=${this.roster.serverVersion >= 2} @click=${this.publishRosterRevision}>
+                ${this.roster.serverVersion >= 2 ? '已是第二版' : '发第二版（换人/改写法）'}
+              </cds-button>
+            </div>
+          </div>
+          ${failed ? html`
+            <cds-inline-notification kind="error" low-contrast title="名册对账失败，只重领会务组这份" subtitle="字幕台的片段正文和上屏内容没有改动；网络恢复后点“重新领取”即可。"></cds-inline-notification>
+          ` : nothing}
+          ${offlinePending ? html`
+            <cds-inline-notification kind="info" low-contrast title="断网期间名册照常可改" subtitle="改动暂存在本地这份名册，回网合并后随“恢复并合并”补送对账。"></cds-inline-notification>
+          ` : nothing}
+
+          ${this.roster.entries.map((entry) => html`
+            <div class="roster-entry ${entry.active ? '' : 'inactive'}">
+              <div class="roster-entry-head">
+                <small>${entry.active ? '在册' : '已停用 / 换人'}</small>
+                <div class="roster-entry-actions">
+                  <cds-button kind=${entry.active ? 'danger--ghost' : 'ghost'} size="xs" @click=${() => this.toggleRosterEntry(entry)}>${entry.active ? '停用' : '恢复'}</cds-button>
+                </div>
+              </div>
+              <input class="roster-input" .value=${entry.officialName} placeholder="正式姓名" @change=${(event: Event) => this.patchRosterEntry(entry.id, { officialName: (event.currentTarget as HTMLInputElement).value })} />
+              <input class="roster-input" .value=${entry.title} placeholder="职务" @change=${(event: Event) => this.patchRosterEntry(entry.id, { title: (event.currentTarget as HTMLInputElement).value })} />
+              <input class="roster-input" .value=${entry.aliases.join('，')} placeholder="片段上可能挂的写法（逗号分隔）" @change=${(event: Event) => this.editRosterAliases(entry.id, (event.currentTarget as HTMLInputElement).value)} />
+            </div>
+          `)}
+
+          <div class="roster-add">
+            <input class="roster-input" placeholder="新发言人正式姓名" .value=${this.rosterName} @input=${(event: Event) => { this.rosterName = (event.currentTarget as HTMLInputElement).value; }} />
+            <input class="roster-input" placeholder="职务" .value=${this.rosterTitle} @input=${(event: Event) => { this.rosterTitle = (event.currentTarget as HTMLInputElement).value; }} />
+            <cds-button class="full" kind="tertiary" size="sm" @click=${this.addRosterEntry}>＋ 名册补录发言人</cds-button>
+          </div>
+
+          <div class="roster-sync">
+            <small>两边按片段挂名逐条对账</small>
+            <cds-button kind="ghost" size="xs" @click=${this.reconcileManually}>立即对账</cds-button>
+          </div>
+
+          ${this.heldGroups.length ? this.heldGroups.map((group) => {
+            const inactive = findRosterEntry(this.roster.entries, group.name);
+            const target = inactive?.replacedBy ? this.roster.entries.find((rosterEntry) => rosterEntry.id === inactive.replacedBy) : undefined;
+            return html`
+              <div class="roster-held">
+                <div class="roster-held-head">
+                  <span>挂名「${group.name}」待确认</span>
+                  <span>#${group.sequences.map((sequence) => String(sequence).padStart(3, '0')).join('、')}</span>
+                </div>
+                <p>${inactive && !inactive.active
+                  ? `名册显示已换人，正式记录为「${inactive.officialName}」${target ? `，接手人：${target.officialName} · ${target.title}` : ''}`
+                  : '出席名册里没有这个写法'}</p>
+                <div class="roster-held-actions">
+                  <cds-button kind="primary" size="xs" @click=${() => this.claimHeldName(group.name)}>补录为正式发言人</cds-button>
+                  ${target ? html`<cds-button kind="tertiary" size="xs" @click=${() => this.reattachHeldName(group.name)}>改挂到「${target.officialName}」</cds-button>` : nothing}
+                </div>
+              </div>
+            `;
+          }) : html`<small style="color:#198038;">所有待确认片段的挂名都能在名册中对上。</small>`}
+        </div>
+      </section>
+    `;
+  }
+
+  // 内联事件里避免直接读状态字段时写错，保留一个语义化小方法。
+  private toggleFailNextRefetch(): void {
+    this.failNextRefetch = !this.failNextRefetch;
+  }
+
+  private renderMigrationNotice() {
+    const report = this.migration;
+    if (!report) return nothing;
+    return html`
+      <section class="inspector-section">
+        <div class="inspector-section-head">
+          <h3>旧数据升级回填</h3>
+          <span>${new Date(report.migratedAt).toLocaleString('zh-CN')}</span>
+        </div>
+        <div style="padding: 10px;">
+          <cds-inline-notification kind=${report.unresolved.length ? 'warning' : 'success'} low-contrast
+            title=${report.unresolved.length ? `旧稿已回填发言人来源，${report.unresolved.length} 段对不上名册` : '旧稿已完成发言人来源回填，全部对得上名册'}
+            subtitle=${`共回填 ${report.backfilled} 条片段的发言人来源；未确认且对不上的已挂起，已上屏的照旧保留并单列。`}>
+            <cds-button slot="action" size="sm" @click=${this.acknowledgeMigration}>知道了</cds-button>
+          </cds-inline-notification>
+          ${report.unresolved.length ? html`
+            <ul class="migration-list">
+              ${report.unresolved.map((item) => html`
+                <li>#${String(item.sequence).padStart(3, '0')} · 挂名「${item.speaker}」${item.onScreen ? ' · 已上屏（照旧保留）' : ' · 已挂起待会务组确认'}</li>
+              `)}
+            </ul>
+          ` : nothing}
+        </div>
+      </section>
     `;
   }
 
@@ -698,6 +1075,9 @@ export class CaptionDesk extends LitElement {
     const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
     return html`
       <div class="inspector">
+        ${this.renderRosterSection()}
+        ${this.renderMigrationNotice()}
+
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>术语快捷规则</h3>
@@ -732,18 +1112,20 @@ export class CaptionDesk extends LitElement {
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>直播区时间线</h3>
-            <span>${confirmed.length} 段已确认</span>
+            <span>${confirmed.length} 段已上屏</span>
           </div>
           <div class="live-timeline">
             ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
               <article class="live-item">
-                <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
+                <time>${formatClock(segment.startTime)} · ${segment.speakerResolved ? `${segment.speakerResolved.officialName}（${segment.speakerResolved.title}）` : segment.speaker}</time>
                 <p>${segment.corrected}</p>
-                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
+                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后按序号合并</small>` : nothing}
+                ${segment.holdReason ? html`<small class="onscreen-hold">${segment.holdReason}</small>` : nothing}
               </article>
             `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
-          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
+          ${this.stats.held > 0 ? html`<div class="delivery-status held">有 ${this.stats.held} 段发言人对账未通过被挂起，会务组确认前不会送进直播区；已上屏内容不受影响。</div>` : nothing}
+          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按序号提交，不会覆盖已确认内容。</div>` : nothing}
         </section>
 
         <section class="inspector-section">
@@ -755,6 +1137,7 @@ export class CaptionDesk extends LitElement {
             ${item ? html`
               <div><strong>原始字幕：</strong>${item.original}</div>
               <div style="margin-top: 8px;"><strong>修改前校正：</strong>${item.corrected}</div>
+              <div style="margin-top: 8px;"><strong>挂名来源：</strong>${item.speakerKey}${item.speakerResolved ? html` · 正式：${item.speakerResolved.officialName} / ${item.speakerResolved.title}` : ' · 名册未命中'}</div>
               <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
             ` : html`<span>请选择片段以查看上下文。</span>`}
           </div>
@@ -780,7 +1163,9 @@ export class CaptionDesk extends LitElement {
             <span class="connection-dot"></span>
             <div class="connection-copy">
               <strong>${connectionLabel(this.model.connection)} · ${this.model.simulatedDelay.toFixed(1)} 秒延迟</strong>
-              <small>${this.model.connection === 'offline' ? '仍可编辑，确认内容进入离线发件箱' : `待确认队列 ${stats.pending} 段 · 最近自动保存 ${new Date(this.model.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`}</small>
+              <small>${this.model.connection === 'offline'
+                ? '仍可编辑，确认内容进入离线发件箱，名册改动也留本地'
+                : `待确认 ${stats.pending} 段 · 挂起 ${stats.held} 段 · 最近自动保存 ${new Date(this.model.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`}</small>
             </div>
           </div>
           <div class="header-actions">
@@ -793,14 +1178,14 @@ export class CaptionDesk extends LitElement {
 
         <section class="status-strip">
           <div class="status-cell hero">
-            <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
-            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
+            <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.held > 0 ? '有片段发言人对账未通过，挂起等会务组确认' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
+            <span>待确认 ${stats.pending} · 挂起 ${stats.held} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
             <div class="queue-track"><span style=${`width:${backlogRatio}%`}></span></div>
           </div>
           <div class="status-cell"><strong>${stats.pending}</strong><span>待确认片段</span></div>
+          <div class="status-cell ${stats.held > 0 ? 'danger' : ''}"><strong>${stats.held}</strong><span>挂起等名册确认</span></div>
           <div class="status-cell warning"><strong>${stats.oldestWaitSeconds}s</strong><span>最长等待时间</span></div>
           <div class="status-cell danger"><strong>${stats.stale + stats.duplicate}</strong><span>需要明确处理</span></div>
-          <div class="status-cell"><strong>${this.model.simulatedDelay.toFixed(1)}s</strong><span>当前流延迟</span></div>
           <div class="font-controls">
             <label>字幕字号</label>
             <cds-button kind="ghost" size="sm" @click=${() => this.adjustFont(-1)}>A−</cds-button>
@@ -814,7 +1199,7 @@ export class CaptionDesk extends LitElement {
             <div class="column-head">
               <div>
                 <h2>待确认区</h2>
-                <p>按收到顺序排列，重复和过期内容不会被静默覆盖</p>
+                <p>按收到顺序排列，挂起、重复和过期内容不会被静默覆盖</p>
               </div>
               <cds-dropdown value=${this.filter} @cds-dropdown-selected=${(event: CustomEvent<{ item: { value: string } }>) => { this.filter = event.detail.item.value as typeof this.filter; }}>
                 <cds-dropdown-item value="active">仅需处理</cds-dropdown-item>
@@ -829,7 +1214,7 @@ export class CaptionDesk extends LitElement {
             <div class="column-head">
               <div>
                 <h2>校对编辑台</h2>
-                <p>标点、专有名词、发言人和数字均可在确认前修改</p>
+                <p>字幕台只管片段正文和挂名；正式姓名与职务以出席名册为准</p>
               </div>
               <cds-tag type="green" size="sm">本地草稿</cds-tag>
             </div>
@@ -839,8 +1224,8 @@ export class CaptionDesk extends LitElement {
           <section class="column">
             <div class="column-head">
               <div>
-                <h2>规则与直播区</h2>
-                <p>确认后进入直播输出；离线内容恢复后统一合并</p>
+                <h2>名册、规则与直播区</h2>
+                <p>名册管正式姓名和职务；挂起片段不上屏，离线内容恢复后统一合并</p>
               </div>
               ${this.model.connection === 'offline'
                 ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
